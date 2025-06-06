@@ -1,4 +1,4 @@
-// main.ts - Comic Search Plugin Phase 1 - Fixed YAML Generation
+// main.ts - Comic Search Plugin Phase 2 - Enhanced YAML Generation
 import { App, Plugin, PluginSettingTab, Setting, Modal, FuzzySuggestModal, Notice, TFile, FuzzyMatch, requestUrl } from 'obsidian';
 
 // ========================
@@ -81,14 +81,17 @@ interface ComicVineVolume {
     };
 }
 
+// Updated data structure for more detailed creator roles and metadata
 interface ComicIssueData {
     issue: ComicVineIssue;
     volume: ComicVineVolume;
     publisher: string;
-    writers: string[];
-    artists: string[];
+    creators: Record<string, string[]>; // e.g., { "Writer": ["Chris Claremont"], "Penciler": ["John Byrne"] }
     characters: string[];
     storyArcs: string[];
+    coverUrl?: string;
+    deck?: string;
+    comicVineUrl: string;
 }
 
 // ========================
@@ -115,7 +118,6 @@ class ComicVineClient {
             await new Promise((resolve, reject) => {
                 const timeout = setTimeout(resolve, delay);
                 
-                // Handle abort during delay
                 if (abortSignal) {
                     abortSignal.addEventListener('abort', () => {
                         clearTimeout(timeout);
@@ -125,7 +127,6 @@ class ComicVineClient {
             });
         }
 
-        // Check if aborted before making request
         if (abortSignal?.aborted) {
             throw new Error('Request aborted');
         }
@@ -205,7 +206,7 @@ class ComicVineClient {
 }
 
 // ========================
-// NOTE GENERATOR - FIXED YAML GENERATION
+// NOTE GENERATOR - ENHANCED YAML
 // ========================
 class ComicNoteGenerator {
     private settings: ComicSearchSettings;
@@ -215,27 +216,22 @@ class ComicNoteGenerator {
     }
 
     generateIssueNote(data: ComicIssueData): string {
-        const { issue, volume, publisher, writers, artists, characters, storyArcs } = data;
-        
-        // Create YAML frontmatter
         const yaml = this.generateYAML(data);
-        
-        // Create markdown content
         const content = this.generateContent(data);
-        
         return `---\n${yaml}\n---\n\n${content}`;
     }
 
     private generateYAML(data: ComicIssueData): string {
-        const { issue, volume, publisher, writers, artists, characters, storyArcs } = data;
+        const { issue, volume, publisher, creators, characters, storyArcs, coverUrl, deck, comicVineUrl } = data;
         
         let yaml = '';
         
         // Reading Tracker compatibility
         if (this.settings.enableReadingTracker) {
+            const primaryWriter = (creators['Writer'] || creators['Script'] || ['Unknown'])[0];
             yaml += `entityType: ComicIssue\n`;
             yaml += `title: ${this.quoteYamlString(`${volume.name} #${issue.issue_number}`)}\n`;
-            yaml += `author: ${this.quoteYamlString(writers[0] || 'Unknown')}\n`;
+            yaml += `author: ${this.quoteYamlString(primaryWriter)}\n`;
             yaml += `pages: ${this.settings.defaultPageCount}\n`;
             yaml += `currentPage: 0\n`;
             yaml += `percentComplete: 0\n`;
@@ -243,58 +239,54 @@ class ComicNoteGenerator {
             yaml += `type: comic\n\n`;
         }
         
-        // Comic metadata
+        // --- Comic Metadata ---
         yaml += `# Comic Metadata\n`;
         yaml += `volume: ${this.formatWikilink(volume.name)}\n`;
         yaml += `issueNumber: ${this.quoteYamlString(issue.issue_number)}\n`;
         yaml += `publisher: ${this.formatWikilink(publisher)}\n`;
         yaml += `coverDate: ${this.quoteYamlString(issue.cover_date)}\n`;
-        
         if (issue.store_date) {
             yaml += `storeDate: ${this.quoteYamlString(issue.store_date)}\n`;
         }
+        if (deck) {
+            yaml += `deck: ${this.quoteYamlString(deck)}\n`;
+        }
+        if (coverUrl) {
+            yaml += `coverUrl: ${coverUrl}\n`;
+        }
+        yaml += `comicVineId: ${String(issue.id)}\n`;
+        yaml += `comicVineUrl: ${comicVineUrl}\n`;
+        if (volume.start_year) {
+            yaml += `volumeStartYear: ${volume.start_year}\n`;
+        }
+        yaml += '\n';
         
-        yaml += `comicVineId: ${this.quoteYamlString(String(issue.id))}\n\n`;
-        
-        // Creators
-        if (writers.length > 0) {
+        // --- Creators ---
+        if (Object.keys(creators).length > 0) {
             yaml += `# Creators\n`;
-            writers.forEach(writer => {
-                yaml += `writer: ${this.formatWikilink(writer)}\n`;
+            // Sort roles for consistent order
+            const sortedRoles = Object.keys(creators).sort(this.sortRoles);
+            sortedRoles.forEach(role => {
+                yaml += this.formatYamlList(creators[role], role, true);
             });
-        }
-        
-        if (artists.length > 0) {
-            artists.forEach(artist => {
-                yaml += `artist: ${this.formatWikilink(artist)}\n`;
-            });
-        }
-        
-        if (writers.length > 0 || artists.length > 0) {
             yaml += '\n';
         }
         
-        // Characters
+        // --- Characters ---
         if (characters.length > 0) {
             yaml += `# Characters\n`;
-            yaml += `features:\n`;
-            characters.forEach(character => {
-                yaml += `  - ${this.formatWikilink(character)}\n`;
-            });
+            yaml += this.formatYamlList(characters, 'features', true);
             yaml += '\n';
         }
         
-        // Story Arcs
+        // --- Story Arcs ---
         if (storyArcs.length > 0) {
             yaml += `# Story Arcs\n`;
-            yaml += `partOfStoryArc:\n`;
-            storyArcs.forEach(arc => {
-                yaml += `  - ${this.formatWikilink(arc)}\n`;
-            });
+            yaml += this.formatYamlList(storyArcs, 'partOfStoryArc', true);
             yaml += '\n';
         }
         
-        // Tags
+        // --- Tags ---
         yaml += `tags:\n`;
         yaml += `  - comic\n`;
         yaml += `  - ${this.sanitizeForTag(publisher)}\n`;
@@ -304,93 +296,85 @@ class ComicNoteGenerator {
     }
 
     /**
-     * Properly formats a wikilink for YAML by cleaning the text and quoting the entire wikilink
+     * Sorts roles into a preferred order for YAML output.
      */
+    private sortRoles(a: string, b: string): number {
+        const order = ['Writer', 'Script', 'Penciler', 'Artist', 'Inker', 'Colorist', 'Letterer', 'Editor', 'Cover Artist'];
+        const indexA = order.indexOf(a);
+        const indexB = order.indexOf(b);
+        if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+        if (indexA !== -1) return -1;
+        if (indexB !== -1) return 1;
+        return a.localeCompare(b);
+    }
+
+    /**
+     * Formats an array of strings into a YAML list.
+     */
+    private formatYamlList(items: string[], key: string, createWikilinks: boolean): string {
+        if (!items || items.length === 0) return '';
+        let yaml = `${key}:\n`;
+        items.forEach(item => {
+            const cleanItem = this.cleanForWikilink(item);
+            const value = createWikilinks ? `[[${cleanItem}]]` : cleanItem;
+            yaml += `  - ${this.quoteYamlString(value)}\n`;
+        });
+        return yaml;
+    }
+    
     private formatWikilink(text: string): string {
         if (!text) return '""';
-        
-        // Clean the text for use in wikilinks
         const cleanText = this.cleanForWikilink(text);
-        
-        // Create the wikilink and quote it for YAML safety
         const wikilink = `[[${cleanText}]]`;
         return this.quoteYamlString(wikilink);
     }
 
-    /**
-     * Cleans text for use inside wikilinks by removing/replacing problematic characters
-     */
     private cleanForWikilink(text: string): string {
         return text
-            // Remove HTML tags
             .replace(/<[^>]*>/g, '')
-            // Remove leading/trailing quotes
             .replace(/^["']|["']$/g, '')
-            // Replace problematic characters that break wikilinks
-            .replace(/\|/g, ' - ')  // Pipe characters break wikilinks
-            .replace(/\[\[|\]\]/g, '') // Remove nested wikilink brackets
-            // Clean up whitespace
+            .replace(/\|/g, ' - ')
+            .replace(/\[\[|\]\]/g, '')
             .replace(/\s+/g, ' ')
             .trim();
     }
 
-    /**
-     * Properly quotes strings for YAML, handling special characters and multiline strings
-     */
     private quoteYamlString(value: string): string {
-        if (!value) return '""';
-        
-        // Check if the string needs quoting
-        const needsQuoting = /[:\[\]{}|>@`"'\\#&*!?\-%]|^\s|\s$|^-|^[0-9]/.test(value) || 
-                           value.includes('\n') || 
-                           value.includes('\r') ||
-                           value.toLowerCase() === 'true' || 
-                           value.toLowerCase() === 'false' ||
-                           value.toLowerCase() === 'null' ||
-                           value.toLowerCase() === 'yes' ||
-                           value.toLowerCase() === 'no';
-        
-        if (!needsQuoting) {
-            return value;
-        }
-        
-        // For multiline strings, use literal block scalar
+        if (value == null) return '""';
+        if (typeof value !== 'string') value = String(value);
+
+        const needsQuoting = /[:\[\]{}|>@`"'\\#&*!?\-%]|^\s|\s$|^-|^[0-9]/.test(value) ||
+                           value.includes('\n') || value.includes('\r') ||
+                           ['true', 'false', 'null', 'yes', 'no'].includes(value.toLowerCase());
+
+        if (!needsQuoting && !value.startsWith('[[')) return value;
+
         if (value.includes('\n')) {
             return '|\n  ' + value.split('\n').join('\n  ');
         }
-        
-        // For single line strings, use double quotes and escape as needed
-        return '"' + value
-            .replace(/\\/g, '\\\\')  // Escape backslashes
-            .replace(/"/g, '\\"')    // Escape quotes
-            .replace(/\n/g, '\\n')   // Escape newlines
-            .replace(/\r/g, '\\r') + '"';  // Escape carriage returns
+
+        return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
     }
 
-    /**
-     * Sanitizes text for use as YAML tags
-     */
     private sanitizeForTag(text: string): string {
         return text
-            .replace(/[^a-zA-Z0-9\s-]/g, '')  // Remove special characters
-            .replace(/\s+/g, '-')             // Replace spaces with hyphens
+            .replace(/[^a-zA-Z0-9\s-]/g, '')
+            .replace(/\s+/g, '-')
             .toLowerCase()
-            .replace(/^-+|-+$/g, '')          // Remove leading/trailing hyphens
-            .replace(/-+/g, '-')              // Collapse multiple hyphens
-            || 'unknown';                      // Fallback if empty
+            .replace(/^-+|-+$/g, '')
+            .replace(/-+/g, '-')
+            || 'unknown';
     }
 
     private generateContent(data: ComicIssueData): string {
-        const { issue, volume, publisher, writers, artists, characters, storyArcs } = data;
+        const { issue, volume, publisher, creators, characters, storyArcs } = data;
         
         let content = '';
         
-        // Cover image
         if (issue.image?.super_url) {
             content += `![cover|150](${issue.image.super_url})\n\n`;
         }
         
-        // Title
         content += `## ${volume.name} #${issue.issue_number}\n`;
         if (issue.name && issue.name !== volume.name) {
             content += `*${issue.name}*\n\n`;
@@ -398,26 +382,23 @@ class ComicNoteGenerator {
             content += '\n';
         }
         
-        // Publication info
         content += `**Published:** ${issue.cover_date}`;
         if (publisher) {
-            content += ` (${publisher})`;
+            content += ` by [[${this.cleanForWikilink(publisher)}]]`;
         }
         content += '\n\n';
         
-        // Creative team
-        if (writers.length > 0 || artists.length > 0) {
+        if (Object.keys(creators).length > 0) {
             content += `### Creative Team\n`;
-            writers.forEach(writer => {
-                content += `- **Writer:** [[${this.cleanForWikilink(writer)}]]\n`;
-            });
-            artists.forEach(artist => {
-                content += `- **Artist:** [[${this.cleanForWikilink(artist)}]]\n`;
+            const sortedRoles = Object.keys(creators).sort(this.sortRoles);
+            sortedRoles.forEach(role => {
+                creators[role].forEach(person => {
+                    content += `- **${role}:** [[${this.cleanForWikilink(person)}]]\n`;
+                });
             });
             content += '\n';
         }
         
-        // Characters
         if (characters.length > 0) {
             content += `### Characters\n`;
             characters.forEach(character => {
@@ -426,16 +407,14 @@ class ComicNoteGenerator {
             content += '\n';
         }
         
-        // Story arcs
         if (storyArcs.length > 0) {
             content += `### Story Arc\n`;
             storyArcs.forEach(arc => {
-                content += `Part of: [[${this.cleanForWikilink(arc)}]]\n`;
+                content += `- Part of: [[${this.cleanForWikilink(arc)}]]\n`;
             });
             content += '\n';
         }
         
-        // Description
         if (issue.description) {
             content += `### Description\n`;
             content += `${this.cleanDescription(issue.description)}\n\n`;
@@ -444,15 +423,12 @@ class ComicNoteGenerator {
             content += `${issue.deck}\n\n`;
         }
         
-        // Reading notes section
         content += `### Reading Notes\n`;
         content += `*Add your thoughts here...*\n\n`;
         
-        // Key events section
         content += `### Key Events\n`;
         content += `- \n\n`;
         
-        // References
         content += `### References\n`;
         content += `- [ComicVine](${issue.site_detail_url})\n`;
         
@@ -461,26 +437,20 @@ class ComicNoteGenerator {
 
     private cleanDescription(description: string): string {
         return description
-            .replace(/<[^>]*>/g, '')
+            .replace(/<[^>]*>/g, '\n') // Replace html tags with newlines to separate paragraphs
             .replace(/&nbsp;/g, ' ')
             .replace(/&amp;/g, '&')
             .replace(/&lt;/g, '<')
             .replace(/&gt;/g, '>')
-            .replace(/\s+/g, ' ')
+            .replace(/\n\s*\n/g, '\n\n') // Collapse multiple newlines
             .trim();
     }
 
     generateFileName(data: ComicIssueData): string {
         const { issue, volume } = data;
-        
-        const sanitize = (str: string) => str
-            .replace(/[<>:"/\\|?*]/g, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-        
+        const sanitize = (str: string) => str.replace(/[<>:"/\\|?*]/g, '').replace(/\s+/g, ' ').trim();
         const volumeName = sanitize(volume.name);
-        const issueNumber = sanitize(issue.issue_number);
-        
+        const issueNumber = sanitize(issue.issue_number).padStart(3, '0'); // Pad issue number for sorting
         return `${volumeName} #${issueNumber}.md`;
     }
 }
@@ -522,7 +492,6 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
     }
     
     getSuggestions(query: string): FuzzyMatch<ComicVineIssue>[] {
-        // Return all results without additional filtering since we're doing our own search
         return this.searchResults.map(issue => ({
             item: issue,
             match: { score: 1, matches: [] }
@@ -533,7 +502,6 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
         const issue = match.item;
         const container = el.createDiv({ cls: 'comic-search-suggestion' });
         
-        // Add cover image if available
         if (issue.image?.small_url) {
             const imageContainer = container.createDiv({ cls: 'comic-search-image' });
             const img = imageContainer.createEl('img', { 
@@ -564,9 +532,7 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
 
     async onChooseItem(issue: ComicVineIssue) {
         try {
-            // Cancel any pending searches
             this.cancelPendingSearch();
-            
             new Notice('Fetching comic details...');
             await this.plugin.createIssueNote(issue);
         } catch (error) {
@@ -576,23 +542,18 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
     }
 
     private cancelPendingSearch() {
-        // Clear debounce timeout
         if (this.searchTimeout) {
             clearTimeout(this.searchTimeout);
             this.searchTimeout = null;
         }
-        
-        // Abort any ongoing request
         if (this.abortController) {
             this.abortController.abort();
             this.abortController = null;
         }
-        
         this.isSearching = false;
     }
 
     private async performSearch(query: string): Promise<void> {
-        // Create new abort controller for this search
         this.abortController = new AbortController();
         const currentController = this.abortController;
         
@@ -600,34 +561,20 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
             this.isSearching = true;
             this.currentSearchQuery = query;
             
-            console.log(`Performing search for: "${query}"`);
-            
-            // Show loading state
             this.searchResults = [];
             (this as any).updateSuggestions();
             
             const results = await this.client.searchIssues(query, currentController.signal);
             
-            // Check if this search was cancelled
-            if (currentController.signal.aborted) {
-                console.log('Search was cancelled');
-                return;
-            }
+            if (currentController.signal.aborted) return;
             
-            // Only update if this is still the current search query
             if (this.currentSearchQuery === query) {
                 this.searchResults = results;
-                console.log(`Search completed for "${query}":`, results.length, 'results');
                 (this as any).updateSuggestions();
             }
             
         } catch (error) {
-            if (currentController.signal.aborted) {
-                console.log('Search request was aborted');
-                return;
-            }
-            
-            console.error('Search failed:', error);
+            if (currentController.signal.aborted) return;
             new Notice(`Search failed: ${error.message}`);
             this.searchResults = [];
             (this as any).updateSuggestions();
@@ -639,17 +586,10 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
         }
     }
 
-    async onInput() {
-        // Get the actual query text from the input element
-        const inputEl = this.inputEl as HTMLInputElement;
-        const query = inputEl.value || '';
-        
-        console.log(`Input changed: "${query}"`);
-        
-        // Cancel any pending search
+    onInput() {
+        const query = this.inputEl.value || '';
         this.cancelPendingSearch();
         
-        // Clear results for short queries
         if (query.length < 3) {
             this.searchResults = [];
             this.currentSearchQuery = '';
@@ -657,64 +597,29 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
             return;
         }
         
-        // Debounce the search - wait for user to stop typing
         this.searchTimeout = setTimeout(() => {
             this.searchTimeout = null;
             if (!this.isSearching) {
                 this.performSearch(query);
             }
-        }, 500); // Wait 500ms after user stops typing
+        }, 500);
     }
 
     onOpen() {
         super.onOpen();
-        
-        const style = document.createElement('style');
-        style.id = 'comic-search-styles'; 
-        if (!document.getElementById(style.id)) {
+        const styleId = 'comic-search-styles';
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement('style');
+            style.id = styleId;
             style.textContent = `
-                .comic-search-suggestion { 
-                    display: flex; 
-                    padding: 8px 0; 
-                    align-items: flex-start;
-                    gap: 8px;
-                }
-                .comic-search-image {
-                    flex-shrink: 0;
-                    width: 40px;
-                }
-                .comic-cover-thumb {
-                    width: 40px;
-                    height: auto;
-                    border-radius: 2px;
-                    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
-                }
-                .comic-search-text {
-                    flex: 1;
-                    min-width: 0;
-                }
-                .comic-search-title { 
-                    font-weight: bold; 
-                    margin-bottom: 2px; 
-                    word-wrap: break-word;
-                }
-                .comic-search-subtitle { 
-                    font-style: italic; 
-                    color: var(--text-muted); 
-                    margin-bottom: 2px; 
-                    word-wrap: break-word;
-                }
-                .comic-search-meta { 
-                    font-size: 0.85em; 
-                    color: var(--text-muted); 
-                    margin-bottom: 4px; 
-                }
-                .comic-search-desc { 
-                    font-size: 0.8em; 
-                    color: var(--text-faint); 
-                    line-height: 1.2; 
-                    word-wrap: break-word;
-                }
+                .comic-search-suggestion { display: flex; padding: 8px 0; align-items: flex-start; gap: 8px; }
+                .comic-search-image { flex-shrink: 0; width: 40px; }
+                .comic-cover-thumb { width: 40px; height: auto; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+                .comic-search-text { flex: 1; min-width: 0; }
+                .comic-search-title { font-weight: bold; margin-bottom: 2px; word-wrap: break-word; }
+                .comic-search-subtitle { font-style: italic; color: var(--text-muted); margin-bottom: 2px; word-wrap: break-word; }
+                .comic-search-meta { font-size: 0.85em; color: var(--text-muted); margin-bottom: 4px; }
+                .comic-search-desc { font-size: 0.8em; color: var(--text-faint); line-height: 1.2; word-wrap: break-word; }
             `;
             document.head.appendChild(style);
         }
@@ -722,14 +627,9 @@ class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
 
     onClose() {
         super.onClose();
-        
-        // Clean up when modal closes
         this.cancelPendingSearch();
-        
         const style = document.getElementById('comic-search-styles');
-        if (style) {
-            style.remove();
-        }
+        if (style) style.remove();
     }
 }
 
@@ -743,7 +643,6 @@ export default class ComicSearchPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
 
-        // Add ribbon icon
         this.addRibbonIcon('book', 'Search Comics', () => {
             if (!this.settings.comicVineApiKey) {
                 new Notice('Please configure your ComicVine API key in settings first');
@@ -752,7 +651,6 @@ export default class ComicSearchPlugin extends Plugin {
             new ComicSearchModal(this.app, this).open();
         });
 
-        // Add command
         this.addCommand({
             id: 'search-comics',
             name: 'Search for comic issues',
@@ -765,9 +663,7 @@ export default class ComicSearchPlugin extends Plugin {
             }
         });
 
-        // Add settings tab
         this.addSettingTab(new ComicSearchSettingTab(this.app, this));
-
         console.log('Comic Search Plugin loaded');
     }
 
@@ -781,10 +677,7 @@ export default class ComicSearchPlugin extends Plugin {
 
     async createIssueNote(issue: ComicVineIssue): Promise<void> {
         try {
-            const client = new ComicVineClient(
-                this.settings.comicVineApiKey,
-                this.settings.rateLimitDelay
-            );
+            const client = new ComicVineClient(this.settings.comicVineApiKey, this.settings.rateLimitDelay);
             
             new Notice('Fetching detailed issue information...');
             const detailedIssue = await client.getIssueDetails(issue.id);
@@ -804,6 +697,7 @@ export default class ComicSearchPlugin extends Plugin {
 
             if (existingFile) {
                 if (!confirm(`A note for ${data.volume.name} #${data.issue.issue_number} already exists. Overwrite?`)) {
+                    new Notice('Note creation cancelled.');
                     return;
                 }
                 if (existingFile instanceof TFile) {
@@ -816,46 +710,55 @@ export default class ComicSearchPlugin extends Plugin {
             if (leaf) {
                 await leaf.openFile(file);
             }
-            
             new Notice(`Created note: ${fileName}`);
             
         } catch (error) {
             console.error('Error creating issue note:', error);
-            throw error;
+            new Notice(`Error creating note: ${error.message}`);
         }
     }
 
     private processIssueData(issue: ComicVineIssue, volume: ComicVineVolume): ComicIssueData {
-        const writers: string[] = [];
-        const artists: string[] = [];
+        const creators: Record<string, string[]> = {};
         
         if (issue.person_credits) {
             issue.person_credits.forEach(credit => {
-                const role = credit.role.toLowerCase();
-                if (role.includes('writer') || role.includes('script')) writers.push(credit.name);
-                else if (role.includes('pencil') || role.includes('artist') || role.includes('draw')) artists.push(credit.name);
+                // Capitalize the first letter of the role and handle multi-word roles
+                const role = credit.role.toLowerCase()
+                                .split(' ')
+                                .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+                                .join(' ');
+
+                if (!creators[role]) {
+                    creators[role] = [];
+                }
+                // Avoid duplicates for the same role
+                if (!creators[role].includes(credit.name)) {
+                    creators[role].push(credit.name);
+                }
             });
         }
         
-        const characters = issue.character_credits ? issue.character_credits.map(char => char.name) : [];
-        const storyArcs = issue.story_arc_credits ? issue.story_arc_credits.map(arc => arc.name) : [];
+        const characters = issue.character_credits ? [...new Set(issue.character_credits.map(char => char.name))] : [];
+        const storyArcs = issue.story_arc_credits ? [...new Set(issue.story_arc_credits.map(arc => arc.name))] : [];
         
         return {
             issue,
             volume,
             publisher: volume.publisher?.name || 'Unknown Publisher',
-            writers: [...new Set(writers)],
-            artists: [...new Set(artists)],
-            characters: [...new Set(characters)],
-            storyArcs: [...new Set(storyArcs)]
+            creators,
+            characters,
+            storyArcs,
+            coverUrl: issue.image?.super_url,
+            deck: issue.deck,
+            comicVineUrl: issue.site_detail_url
         };
     }
 
     private async ensureComicsFolder(): Promise<void> {
-        const { vault } = this.app;
         const folderPath = this.settings.comicsFolder;
-        if (!vault.getAbstractFileByPath(folderPath)) {
-            await vault.createFolder(folderPath);
+        if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+            await this.app.vault.createFolder(folderPath);
             new Notice(`Created comics folder: ${folderPath}`);
         }
     }
@@ -950,7 +853,7 @@ class ComicSearchSettingTab extends PluginSettingTab {
                 <li>Search by typing: "Uncanny X-Men 141", "Batman Detective Comics", etc.</li>
                 <li>Select an issue from the results to create a note</li>
             </ol>
-            <p><strong>Note:</strong> This plugin respects ComicVine's rate limits (200 requests per hour). 
+            <p><strong>Note:</strong> This plugin respects ComicVine's rate limits. 
             Search results may take a moment to appear.</p>
         `;
     }
