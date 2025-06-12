@@ -1,13 +1,24 @@
-// main.ts - Comic Search Plugin Phase 7 - Correct Death Date Parsing
-import { App, Plugin, PluginSettingTab, Setting, Modal, FuzzySuggestModal, Notice, TFile, FuzzyMatch, requestUrl } from 'obsidian';
+// main.ts - CORRECTED AND HARMONIZED
+import { App, Plugin, PluginSettingTab, Setting, Modal, FuzzySuggestModal, Notice, TFile, FuzzyMatch, requestUrl, stringifyYaml,parseYaml } from 'obsidian';
 
 // ========================
-// INTERFACES & TYPES
+// INTERFACES & TYPES (No changes here, but showing DateTimeInfo for context)
 // ========================
+
+// This interface should be consistent with your ontology.ts
+interface DateTimeInfo {
+  value?: string;           // Human-readable representation
+  year?: number;            // Year value (negative for BCE)
+  month?: number;           // 1-12
+  day?: number;             // 1-31
+  isApproximate?: boolean; // Whether the date is approximate
+}
 
 interface ComicSearchSettings {
     comicVineApiKey: string;
     comicsFolder: string;
+    // NEW/SUGGESTED: A shared folder for all people notes
+    peopleFolder: string;
     defaultPageCount: number;
     enableReadingTracker: boolean;
     rateLimitDelay: number;
@@ -17,6 +28,8 @@ interface ComicSearchSettings {
 const DEFAULT_SETTINGS: ComicSearchSettings = {
     comicVineApiKey: '',
     comicsFolder: 'Comics',
+    // NEW/SUGGESTED: Default value for the shared people folder
+    peopleFolder: 'Entities/People',
     defaultPageCount: 22,
     enableReadingTracker: true,
     rateLimitDelay: 1000,
@@ -83,7 +96,6 @@ interface ComicVineVolume {
     };
 }
 
-// UPDATED: Correct interface for the person response
 interface ComicVinePerson {
     id: number;
     name: string;
@@ -114,9 +126,8 @@ interface ComicIssueData {
 }
 
 // ========================
-// COMICVINE API CLIENT
+// COMICVINE API CLIENT (No changes here)
 // ========================
-
 class ComicVineClient {
     private apiKey: string;
     private baseUrl = 'https://comicvine.gamespot.com/api';
@@ -160,8 +171,8 @@ class ComicVineClient {
             return response.json;
         } catch (error) {
             console.error("ComicVine API request failed:", error);
-            if (error.status) throw new Error(`API request failed: Status ${error.status}`);
-            throw new Error(`API request failed: ${error.message}`);
+            if ((error as any).status) throw new Error(`API request failed: Status ${(error as any).status}`);
+            throw new Error(`API request failed: ${(error as Error).message}`);
         }
     }
 
@@ -175,7 +186,7 @@ class ComicVineClient {
             if (response.error !== 'OK') throw new Error(`ComicVine API error: ${response.error}`);
             return response.results || [];
         } catch (error) {
-            if (error.message === 'Request aborted') throw error;
+            if ((error as Error).message === 'Request aborted') throw error;
             console.error('ComicVine search failed:', error);
             throw error;
         }
@@ -219,109 +230,289 @@ class ComicVineClient {
     }
 }
 
-// ========================
-// NOTE GENERATOR
-// ========================
-class ComicNoteGenerator {
-    private settings: ComicSearchSettings;
 
-    constructor(settings: ComicSearchSettings) {
-        this.settings = settings;
+// ========================
+// SEARCH MODAL (No changes here)
+// ========================
+class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
+    private plugin: ComicSearchPlugin;
+    private client: ComicVineClient;
+    private searchResults: ComicVineIssue[] = [];
+    private isSearching = false;
+    private searchTimeout: NodeJS.Timeout | null = null;
+    private currentSearchQuery = '';
+    private abortController: AbortController | null = null;
+
+    constructor(app: App, plugin: ComicSearchPlugin) {
+        super(app);
+        this.plugin = plugin;
+        this.client = new ComicVineClient(plugin.settings.comicVineApiKey, plugin.settings.rateLimitDelay);
+        this.setPlaceholder("Search for comic issues (e.g., 'Uncanny X-Men 141')");
+        this.setInstructions([{ command: "↑↓", purpose: "navigate" }, { command: "↵", purpose: "select issue" }, { command: "esc", purpose: "dismiss" }]);
     }
 
-    generateIssueNote(data: ComicIssueData): string {
+    getItems(): ComicVineIssue[] { return this.searchResults; }
+    getItemText(issue: ComicVineIssue): string { return `${issue.volume.name} #${issue.issue_number}${issue.name ? ` - ${issue.name}` : ''}`; }
+    getSuggestions(query: string): FuzzyMatch<ComicVineIssue>[] { return this.searchResults.map(issue => ({ item: issue, match: { score: 1, matches: [] } })); }
+
+    renderSuggestion(match: FuzzyMatch<ComicVineIssue>, el: HTMLElement) {
+        const issue = match.item;
+        const container = el.createDiv({ cls: 'comic-search-suggestion' });
+        if (issue.image?.small_url) {
+            const imageContainer = container.createDiv({ cls: 'comic-search-image' });
+            const img = imageContainer.createEl('img', { cls: 'comic-cover-thumb', attr: { src: issue.image.small_url, alt: 'Cover' } });
+            img.onerror = () => { imageContainer.style.display = 'none'; };
+        }
+        const textContainer = container.createDiv({ cls: 'comic-search-text' });
+        textContainer.createDiv({ cls: 'comic-search-title' }).setText(`${issue.volume.name} #${issue.issue_number}`);
+        if (issue.name && issue.name !== issue.volume.name) textContainer.createDiv({ cls: 'comic-search-subtitle', text: issue.name });
+        textContainer.createDiv({ cls: 'comic-search-meta', text: `${issue.cover_date || 'Unknown date'}` });
+        if (issue.deck) textContainer.createDiv({ cls: 'comic-search-desc', text: issue.deck.substring(0, 120) + (issue.deck.length > 120 ? '...' : '') });
+    }
+
+    async onChooseItem(issue: ComicVineIssue) {
+        try {
+            this.cancelPendingSearch();
+            new Notice('Fetching comic details...');
+            await this.plugin.createIssueNote(issue);
+        } catch (error) {
+            new Notice(`Failed to create comic note: ${(error as Error).message}`);
+            console.error('Failed to create comic note:', error);
+        }
+    }
+
+    private cancelPendingSearch() {
+        if (this.searchTimeout) { clearTimeout(this.searchTimeout); this.searchTimeout = null; }
+        if (this.abortController) { this.abortController.abort(); this.abortController = null; }
+        this.isSearching = false;
+    }
+
+    private async performSearch(query: string): Promise<void> {
+        this.abortController = new AbortController();
+        const currentController = this.abortController;
+        try {
+            this.isSearching = true;
+            this.currentSearchQuery = query;
+            this.searchResults = [];
+            (this as any).updateSuggestions();
+            const results = await this.client.searchIssues(query, currentController.signal);
+            if (currentController.signal.aborted) return;
+            if (this.currentSearchQuery === query) {
+                this.searchResults = results;
+                (this as any).updateSuggestions();
+            }
+        } catch (error) {
+            if (currentController.signal.aborted) return;
+            new Notice(`Search failed: ${(error as Error).message}`);
+            this.searchResults = [];
+            (this as any).updateSuggestions();
+        } finally {
+            if (currentController === this.abortController) {
+                this.isSearching = false;
+                this.abortController = null;
+            }
+        }
+    }
+
+    onInput() {
+        const query = this.inputEl.value || '';
+        this.cancelPendingSearch();
+        if (query.length < 3) {
+            this.searchResults = [];
+            this.currentSearchQuery = '';
+            (this as any).updateSuggestions();
+            return;
+        }
+        this.searchTimeout = setTimeout(() => {
+            this.searchTimeout = null;
+            if (!this.isSearching) this.performSearch(query);
+        }, 500);
+    }
+
+    onOpen() {
+        super.onOpen();
+        const styleId = 'comic-search-styles';
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement('style');
+            style.id = styleId;
+            style.textContent = `
+                .comic-search-suggestion { display: flex; padding: 8px 0; align-items: flex-start; gap: 8px; }
+                .comic-search-image { flex-shrink: 0; width: 40px; }
+                .comic-cover-thumb { width: 40px; height: auto; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+                .comic-search-text { flex: 1; min-width: 0; }
+                .comic-search-title { font-weight: bold; } .comic-search-subtitle { font-style: italic; color: var(--text-muted); }
+                .comic-search-meta { font-size: 0.85em; color: var(--text-muted); } .comic-search-desc { font-size: 0.8em; color: var(--text-faint); }
+            `;
+            document.head.appendChild(style);
+        }
+    }
+
+    onClose() {
+        super.onClose();
+        this.cancelPendingSearch();
+        const style = document.getElementById('comic-search-styles');
+        if (style) style.remove();
+    }
+}
+
+
+// ========================
+// MAIN PLUGIN CLASS
+// ========================
+
+export default class ComicSearchPlugin extends Plugin {
+    settings: ComicSearchSettings;
+
+    async onload() {
+        await this.loadSettings();
+        this.addRibbonIcon('book', 'Search Comics', () => {
+            if (!this.settings.comicVineApiKey) {
+                new Notice('Please configure your ComicVine API key in settings first');
+                return;
+            }
+            new ComicSearchModal(this.app, this).open();
+        });
+        this.addCommand({
+            id: 'search-comics',
+            name: 'Search for comic issues',
+            callback: () => {
+                if (!this.settings.comicVineApiKey) {
+                    new Notice('Please configure your ComicVine API key in settings first');
+                    return;
+                }
+                new ComicSearchModal(this.app, this).open();
+            }
+        });
+        this.addSettingTab(new ComicSearchSettingTab(this.app, this));
+        console.log('Comic Search Plugin loaded');
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+
+    async createIssueNote(issue: ComicVineIssue): Promise<void> {
+        try {
+            const client = new ComicVineClient(this.settings.comicVineApiKey, this.settings.rateLimitDelay);
+            
+            new Notice('Fetching detailed issue information...');
+            const detailedIssue = await client.getIssueDetails(issue.id);
+            
+            new Notice('Fetching volume information...');
+            const volume = await client.getVolumeDetails(issue.volume.id);
+            
+            const data = this.processIssueData(detailedIssue, volume);
+            const noteContent = this.generateIssueNote(data);
+            const fileName = this.generateFileName(data);
+            
+            await this.ensureFolderExists(this.settings.comicsFolder);
+            
+            const filePath = `${this.settings.comicsFolder}/${fileName}`;
+            const existingFile = this.app.vault.getAbstractFileByPath(filePath);
+
+            if (existingFile) {
+                new Notice(`Note for ${data.volume.name} #${data.issue.issue_number} already exists. To overwrite, delete it first.`);
+                return;
+            }
+            
+            const file = await this.app.vault.create(filePath, noteContent);
+            
+            if (this.settings.createCreatorNotes) {
+                await this.ensureCreatorNotesExist(detailedIssue.person_credits, file);
+            }
+
+            const leaf = this.app.workspace.getMostRecentLeaf();
+            if (leaf) await leaf.openFile(file);
+            new Notice(`Created note: ${fileName}`);
+            
+        } catch (error) {
+            console.error('Error creating issue note:', error);
+            new Notice(`Error creating note: ${(error as Error).message}`);
+        }
+    }
+    
+    // ===============================================
+    // NOTE GENERATION HELPERS (CORRECTED)
+    // ===============================================
+
+    private generateIssueNote(data: ComicIssueData): string {
         const yaml = this.generateYAML(data);
         const content = this.generateContent(data);
         return `---\n${yaml}\n---\n\n${content}`;
     }
 
-    generateCreatorNote(person: ComicVinePerson): string {
-        const yaml = this.generateCreatorYAML(person);
-        const content = this.generateCreatorContent(person);
-        return `---\n${yaml}\n---\n\n${content}`;
-    }
-
-    private parseCreatorDate(dateString: string | null): { year: number, month?: number, day?: number } | null {
+    /**
+     * FIX: Harmonized date parsing to return a DateTimeInfo object, consistent with ontology.
+     */
+    private parseCreatorDate(dateString: string | null): DateTimeInfo | null {
         if (!dateString || typeof dateString !== 'string') {
             return null;
         }
-    
-        const parsedDate = new Date(dateString);
-        if (!isNaN(parsedDate.getTime()) && parsedDate.getUTCFullYear() > 1) {
-            return {
-                year: parsedDate.getUTCFullYear(),
-                month: parsedDate.getUTCMonth() + 1,
-                day: parsedDate.getUTCDate()
-            };
-        }
-    
-        const parts = dateString.split('-');
-        if (parts.length >= 1) {
-            const year = parseInt(parts[0], 10);
-            if (!isNaN(year)) {
-                const result: { year: number, month?: number, day?: number } = { year };
-                if (parts.length > 1) {
-                    const month = parseInt(parts[1], 10);
-                    if (month > 0) result.month = month;
-                }
-                if (parts.length > 2) {
-                    const day = parseInt(parts[2], 10);
-                    if (day > 0) result.day = day;
-                }
-                return result;
+
+        const date = new Date(dateString);
+        if (!isNaN(date.getTime())) {
+            // Attempt to create a standard format, but prioritize what's given
+            const year = date.getUTCFullYear();
+            if (year < 100) return { value: dateString }; // Avoid weird dates
+            
+            const month = date.getUTCMonth() + 1;
+            const day = date.getUTCDate();
+            
+            const info: DateTimeInfo = { value: dateString, year: year };
+            // Check if the original string was just a year
+            if (dateString.match(/^\d{4}$/)) {
+                 return { value: dateString, year: year };
             }
+            // Check if it was year-month
+            if (dateString.match(/^\d{4}-\d{2}$/)) {
+                info.month = month;
+                return info;
+            }
+            // Assume full date otherwise
+            info.month = month;
+            info.day = day;
+            return info;
         }
     
-        return null;
+        return { value: dateString }; // Fallback for non-standard date strings
     }
 
-    private generateCreatorYAML(person: ComicVinePerson): string {
-        let yaml = `entityType: ComicCreator\n`;
-        yaml += `name: ${this.quoteYamlString(person.name)}\n`;
-
+    /**
+     * FIX: Changed from generateCreatorYAML to generateCreatorFrontmatter.
+     * It now returns a frontmatter OBJECT instead of a string to prevent YAML nesting errors.
+     */
+    private generateCreatorFrontmatter(person: ComicVinePerson): any {
+        const frontmatter: any = {
+            entityType: "Person",
+            name: person.name,
+            comicVineId: person.id,
+            comicVineUrl: person.site_detail_url,
+        };
+    
         const birthInfo = this.parseCreatorDate(person.birth);
         if (birthInfo) {
-            yaml += `birthDate:\n`;
-            yaml += `  year: ${birthInfo.year}\n`;
-            if (birthInfo.month) yaml += `  month: ${birthInfo.month}\n`;
-            if (birthInfo.day) yaml += `  day: ${birthInfo.day}\n`;
+            frontmatter.birthDate = birthInfo;
         }
-
-        // UPDATED: Check for the nested death object and its 'date' property
-        const deathDateString = (person.death && typeof person.death === 'object' && person.death.date) 
-                                ? person.death.date 
-                                : null;
+    
+        const deathDateString = person.death?.date || null;
         const deathInfo = this.parseCreatorDate(deathDateString);
         if (deathInfo) {
-            yaml += `deathDate:\n`;
-            yaml += `  year: ${deathInfo.year}\n`;
-            if (deathInfo.month) yaml += `  month: ${deathInfo.month}\n`;
-            if (deathInfo.day) yaml += `  day: ${deathInfo.day}\n`;
-        }
-
-        yaml += `comicVineId: ${person.id}\n`;
-        yaml += `comicVineUrl: ${person.site_detail_url}\n`;
-        yaml += `tags:\n  - comic-creator\n`;
-        return yaml;
-    }
-
-    private generateCreatorContent(person: ComicVinePerson): string {
-        let content = '';
-        if (person.image?.super_url) {
-            content += `![image|150](${person.image.super_url})\n\n`;
+            frontmatter.deathDate = deathInfo;
         }
         
-        content += `# ${person.name}\n\n`;
-        
-        content += `## Works\n`;
-        content += `*This section can be populated by other plugins or backlinks.*\n\n`;
-        
-        content += `### References\n`;
-        content += `- [ComicVine Profile](${person.site_detail_url})\n`;
-        
-        return content;
-    }
+        // These are initialized for additive updates later.
+        frontmatter.tags = ['person'];
+        frontmatter.roles = [];
+        frontmatter.credits = [];
     
+        return frontmatter;
+    }
+
+
     private mapRoleToOntologyKey(role: string): string {
         const roleLower = role.toLowerCase().trim();
         const mapping: Record<string, string> = {
@@ -481,247 +672,180 @@ class ComicNoteGenerator {
         return description.replace(/<[^>]*>/g, '\n').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/\n\s*\n/g, '\n\n').trim();
     }
 
-    generateFileName(data: ComicIssueData): string {
+    private generateFileName(data: ComicIssueData): string {
         const sanitize = (str: string) => str.replace(/[<>:"/\\|?*]/g, '').replace(/\s+/g, ' ').trim();
         const volumeName = sanitize(data.volume.name);
         const issueNumber = sanitize(data.issue.issue_number).padStart(3, '0');
         return `${volumeName} #${issueNumber}.md`;
     }
-}
 
-// ========================
-// SEARCH MODAL
-// ========================
-class ComicSearchModal extends FuzzySuggestModal<ComicVineIssue> {
-    private plugin: ComicSearchPlugin;
-    private client: ComicVineClient;
-    private searchResults: ComicVineIssue[] = [];
-    private isSearching = false;
-    private searchTimeout: NodeJS.Timeout | null = null;
-    private currentSearchQuery = '';
-    private abortController: AbortController | null = null;
-
-    constructor(app: App, plugin: ComicSearchPlugin) {
-        super(app);
-        this.plugin = plugin;
-        this.client = new ComicVineClient(plugin.settings.comicVineApiKey, plugin.settings.rateLimitDelay);
-        this.setPlaceholder("Search for comic issues (e.g., 'Uncanny X-Men 141')");
-        this.setInstructions([{ command: "↑↓", purpose: "navigate" }, { command: "↵", purpose: "select issue" }, { command: "esc", purpose: "dismiss" }]);
-    }
-
-    getItems(): ComicVineIssue[] { return this.searchResults; }
-    getItemText(issue: ComicVineIssue): string { return `${issue.volume.name} #${issue.issue_number}${issue.name ? ` - ${issue.name}` : ''}`; }
-    getSuggestions(query: string): FuzzyMatch<ComicVineIssue>[] { return this.searchResults.map(issue => ({ item: issue, match: { score: 1, matches: [] } })); }
-
-    renderSuggestion(match: FuzzyMatch<ComicVineIssue>, el: HTMLElement) {
-        const issue = match.item;
-        const container = el.createDiv({ cls: 'comic-search-suggestion' });
-        if (issue.image?.small_url) {
-            const imageContainer = container.createDiv({ cls: 'comic-search-image' });
-            const img = imageContainer.createEl('img', { cls: 'comic-cover-thumb', attr: { src: issue.image.small_url, alt: 'Cover' } });
-            img.onerror = () => { imageContainer.style.display = 'none'; };
-        }
-        const textContainer = container.createDiv({ cls: 'comic-search-text' });
-        textContainer.createDiv({ cls: 'comic-search-title' }).setText(`${issue.volume.name} #${issue.issue_number}`);
-        if (issue.name && issue.name !== issue.volume.name) textContainer.createDiv({ cls: 'comic-search-subtitle', text: issue.name });
-        textContainer.createDiv({ cls: 'comic-search-meta', text: `${issue.cover_date || 'Unknown date'}` });
-        if (issue.deck) textContainer.createDiv({ cls: 'comic-search-desc', text: issue.deck.substring(0, 120) + (issue.deck.length > 120 ? '...' : '') });
-    }
-
-    async onChooseItem(issue: ComicVineIssue) {
-        try {
-            this.cancelPendingSearch();
-            new Notice('Fetching comic details...');
-            await this.plugin.createIssueNote(issue);
-        } catch (error) {
-            new Notice(`Failed to create comic note: ${error.message}`);
-            console.error('Failed to create comic note:', error);
-        }
-    }
-
-    private cancelPendingSearch() {
-        if (this.searchTimeout) { clearTimeout(this.searchTimeout); this.searchTimeout = null; }
-        if (this.abortController) { this.abortController.abort(); this.abortController = null; }
-        this.isSearching = false;
-    }
-
-    private async performSearch(query: string): Promise<void> {
-        this.abortController = new AbortController();
-        const currentController = this.abortController;
-        try {
-            this.isSearching = true;
-            this.currentSearchQuery = query;
-            this.searchResults = [];
-            (this as any).updateSuggestions();
-            const results = await this.client.searchIssues(query, currentController.signal);
-            if (currentController.signal.aborted) return;
-            if (this.currentSearchQuery === query) {
-                this.searchResults = results;
-                (this as any).updateSuggestions();
-            }
-        } catch (error) {
-            if (currentController.signal.aborted) return;
-            new Notice(`Search failed: ${error.message}`);
-            this.searchResults = [];
-            (this as any).updateSuggestions();
-        } finally {
-            if (currentController === this.abortController) {
-                this.isSearching = false;
-                this.abortController = null;
-            }
-        }
-    }
-
-    onInput() {
-        const query = this.inputEl.value || '';
-        this.cancelPendingSearch();
-        if (query.length < 3) {
-            this.searchResults = [];
-            this.currentSearchQuery = '';
-            (this as any).updateSuggestions();
+    // ===============================================
+    // PLUGIN-LEVEL HELPERS (CORRECTED)
+    // ===============================================
+    
+    /**
+     * FIX: Major logic overhaul to handle existing files correctly and prevent YAML corruption.
+     * This function now performs additive updates to person notes.
+     */
+    private async ensureCreatorNotesExist(creators: ComicVineIssue['person_credits'], issueFile: TFile): Promise<void> {
+        if (!this.settings.createCreatorNotes || !creators || creators.length === 0) {
             return;
         }
-        this.searchTimeout = setTimeout(() => {
-            this.searchTimeout = null;
-            if (!this.isSearching) this.performSearch(query);
-        }, 500);
-    }
-
-    onOpen() {
-        super.onOpen();
-        const styleId = 'comic-search-styles';
-        if (!document.getElementById(styleId)) {
-            const style = document.createElement('style');
-            style.id = styleId;
-            style.textContent = `
-                .comic-search-suggestion { display: flex; padding: 8px 0; align-items: flex-start; gap: 8px; }
-                .comic-search-image { flex-shrink: 0; width: 40px; }
-                .comic-cover-thumb { width: 40px; height: auto; border-radius: 2px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
-                .comic-search-text { flex: 1; min-width: 0; }
-                .comic-search-title { font-weight: bold; } .comic-search-subtitle { font-style: italic; color: var(--text-muted); }
-                .comic-search-meta { font-size: 0.85em; color: var(--text-muted); } .comic-search-desc { font-size: 0.8em; color: var(--text-faint); }
-            `;
-            document.head.appendChild(style);
-        }
-    }
-
-    onClose() {
-        super.onClose();
-        this.cancelPendingSearch();
-        const style = document.getElementById('comic-search-styles');
-        if (style) style.remove();
-    }
-}
-
-// ========================
-// MAIN PLUGIN CLASS
-// ========================
-
-export default class ComicSearchPlugin extends Plugin {
-    settings: ComicSearchSettings;
-
-    async onload() {
-        await this.loadSettings();
-        this.addRibbonIcon('book', 'Search Comics', () => {
-            if (!this.settings.comicVineApiKey) {
-                new Notice('Please configure your ComicVine API key in settings first');
-                return;
-            }
-            new ComicSearchModal(this.app, this).open();
-        });
-        this.addCommand({
-            id: 'search-comics',
-            name: 'Search for comic issues',
-            callback: () => {
-                if (!this.settings.comicVineApiKey) {
-                    new Notice('Please configure your ComicVine API key in settings first');
-                    return;
-                }
-                new ComicSearchModal(this.app, this).open();
-            }
-        });
-        this.addSettingTab(new ComicSearchSettingTab(this.app, this));
-        console.log('Comic Search Plugin loaded');
-    }
-
-    async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    }
-
-    async saveSettings() {
-        await this.saveData(this.settings);
-    }
-
-    async createIssueNote(issue: ComicVineIssue): Promise<void> {
-        try {
-            const client = new ComicVineClient(this.settings.comicVineApiKey, this.settings.rateLimitDelay);
-            
-            new Notice('Fetching detailed issue information...');
-            const detailedIssue = await client.getIssueDetails(issue.id);
-            
-            new Notice('Fetching volume information...');
-            const volume = await client.getVolumeDetails(issue.volume.id);
-            
-            if (this.settings.createCreatorNotes) {
-                this.ensureCreatorNotesExist(detailedIssue.person_credits);
-            }
-            
-            const data = this.processIssueData(detailedIssue, volume);
-            const generator = new ComicNoteGenerator(this.settings);
-            const noteContent = generator.generateIssueNote(data);
-            const fileName = generator.generateFileName(data);
-            
-            await this.ensureComicsFolder();
-            
-            const filePath = `${this.settings.comicsFolder}/${fileName}`;
-            const existingFile = this.app.vault.getAbstractFileByPath(filePath);
-
-            if (existingFile) {
-                new Notice(`Note for ${data.volume.name} #${data.issue.issue_number} already exists. To overwrite, delete it first.`);
-                return;
-            }
-            
-            const file = await this.app.vault.create(filePath, noteContent);
-            const leaf = this.app.workspace.getMostRecentLeaf();
-            if (leaf) await leaf.openFile(file);
-            new Notice(`Created note: ${fileName}`);
-            
-        } catch (error) {
-            console.error('Error creating issue note:', error);
-            new Notice(`Error creating note: ${error.message}`);
-        }
-    }
     
-    private async ensureCreatorNotesExist(creators: ComicVineIssue['person_credits']): Promise<void> {
-        if (!this.settings.createCreatorNotes || !creators || creators.length === 0) return;
-
         const client = new ComicVineClient(this.settings.comicVineApiKey, this.settings.rateLimitDelay);
-        const generator = new ComicNoteGenerator(this.settings);
-        const creatorsFolder = `${this.settings.comicsFolder}/Creators`;
+        // SUGGESTION: Use the shared people folder setting
+        const creatorsFolder = this.settings.peopleFolder; 
+        await this.ensureFolderExists(creatorsFolder);
         
-        if (!this.app.vault.getAbstractFileByPath(creatorsFolder)) {
-            await this.app.vault.createFolder(creatorsFolder);
-        }
-
-        const uniqueCreators = new Map<number, typeof creators[0]>();
-        creators.forEach(c => uniqueCreators.set(c.id, c));
+        const uniqueCreators = new Map<number, { id: number; name: string; api_detail_url: string; roles: string[] }>();
+        creators.forEach(c => {
+            const existing = uniqueCreators.get(c.id);
+            if (existing) {
+                existing.roles.push(...c.role.split(',').map(r => r.trim()));
+            } else {
+                uniqueCreators.set(c.id, { ...c, roles: c.role.split(',').map(r => r.trim()) });
+            }
+        });
 
         for (const creator of uniqueCreators.values()) {
-            const fileName = creator.name.replace(/[<>:"/\\|?*]/g, '').trim() + '.md';
-            const filePath = `${creatorsFolder}/${fileName}`;
-            if (this.app.vault.getAbstractFileByPath(filePath)) continue;
+            const personFileName = creator.name.replace(/[<>:"/\\|?*]/g, '').trim() + '.md';
+            const personFilePath = `${creatorsFolder}/${personFileName}`;
+            let personFile = this.app.vault.getAbstractFileByPath(personFilePath) as TFile;
+            let frontmatter: any;
+            let body = ''; // Default body can be empty or a template
+    
+            if (personFile) {
+                // File exists, parse it for additive update
+                const parsed = this.parseFrontmatter(await this.app.vault.read(personFile));
+                frontmatter = parsed.frontmatter;
+                body = parsed.body;
+            } else {
+                // File does not exist, create base frontmatter
+                try {
+                    new Notice(`Fetching details for new person: ${creator.name}...`, 2000);
+                    const personDetails = await client.getPersonDetails(creator.api_detail_url);
+                    frontmatter = this.generateCreatorFrontmatter(personDetails);
+                    // A default body could be set here if desired, e.g., body = `# ${creator.name}\n\n`;
+                } catch (error) {
+                    new Notice(`Failed to create note for ${creator.name}: ${(error as Error).message}`, 5000);
+                    console.error(`Failed to process creator ${creator.name} (ID: ${creator.id}):`, error);
+                    continue; // Skip to next creator
+                }
+            }
 
-            try {
-                new Notice(`Fetching details for creator: ${creator.name}...`, 2000);
-                const personDetails = await client.getPersonDetails(creator.api_detail_url);
-                const noteContent = generator.generateCreatorNote(personDetails);
-                await this.app.vault.create(filePath, noteContent);
-                new Notice(`Created note for creator: ${creator.name}`, 3000);
-            } catch (error) {
-                new Notice(`Failed to create note for ${creator.name}: ${error.message}`, 5000);
-                console.error(`Failed to process creator ${creator.name} (ID: ${creator.id}):`, error);
+            // --- Additive Update Logic ---
+            let changed = false;
+    
+            // Ensure arrays exist for adding new data
+            if (!frontmatter.roles || !Array.isArray(frontmatter.roles)) frontmatter.roles = [];
+            if (!frontmatter.credits || !Array.isArray(frontmatter.credits)) frontmatter.credits = [];
+            if (!frontmatter.tags || !Array.isArray(frontmatter.tags)) frontmatter.tags = [];
+
+            if (!frontmatter.tags.includes('person')) {
+                frontmatter.tags.push('person');
+                changed = true;
+            }
+    
+            for (const roleName of new Set(creator.roles)) { // Use Set to avoid duplicate roles for the same issue
+                if (!roleName) continue;
+                const roleNote = await this.getOrCreateRoleNote(roleName);
+                const roleLink = `[[${roleNote.basename}]]`;
+
+                // Add to simple roles list
+                if (!frontmatter.roles.includes(roleLink)) {
+                    frontmatter.roles.push(roleLink);
+                    changed = true;
+                }
+                
+                // Add to detailed credits list
+                const issueLink = `[[${issueFile.basename}]]`;
+                const newCredit = { role: roleLink, work: issueLink };
+                const creditExists = frontmatter.credits.some((c: any) => c.role === newCredit.role && c.work === newCredit.work);
+
+                if (!creditExists) {
+                    frontmatter.credits.push(newCredit);
+                    changed = true;
+                }
+            }
+            
+            if (changed) {
+                frontmatter.roles.sort();
+                const newContent = this.buildFrontmatter(frontmatter, body);
+                if (personFile) {
+                    await this.app.vault.modify(personFile, newContent);
+                } else {
+                    personFile = await this.app.vault.create(personFilePath, newContent);
+                }
             }
         }
+    }
+
+    private async getOrCreateRoleNote(roleName: string): Promise<TFile> {
+        const capitalizedRole = roleName.charAt(0).toUpperCase() + roleName.slice(1).trim();
+        const filename = capitalizedRole.replace(/[<>:"/\\|?*]/g, '').trim() + ' (Role).md';
+        const conceptsFolder = `${this.settings.comicsFolder}/Concepts`;
+
+        await this.ensureFolderExists(conceptsFolder);
+
+        const filepath = `${conceptsFolder}/${filename}`;
+        let file = this.app.vault.getAbstractFileByPath(filepath) as TFile;
+
+        if (!file) {
+            const frontmatter: any = {
+                entityType: "RoleConcept",
+                name: capitalizedRole
+            };
+            const roleHierarchy: Record<string, string> = {
+                'Penciler': 'Artist', 'Penciller': 'Artist', 'Inker': 'Artist',
+                'Colorist': 'Artist', 'Cover artist': 'Artist', 'Script': 'Writer'
+            };
+            if (roleHierarchy[capitalizedRole]) {
+                const parentRoleName = roleHierarchy[capitalizedRole];
+                const parentRoleNote = await this.getOrCreateRoleNote(parentRoleName);
+                frontmatter.subConceptOf = `[[${parentRoleNote.basename}]]`;
+            }
+            const content = this.buildFrontmatter(frontmatter, `# ${capitalizedRole}\n\n## People with this Role\n\n`);
+            file = await this.app.vault.create(filepath, content);
+            new Notice(`Created role note: ${filename}`);
+        }
+        return file;
+    }
+
+    private parseFrontmatter(content: string): { frontmatter: any, body: string } {
+        const frontmatterMatch = content.match(/^---\s*[\r\n]+([\s\S]*?)[\r\n]+---\s*[\r\n]?([\s\S]*)$/);
+        if (frontmatterMatch) {
+            try {
+                const frontmatter = parseYaml(frontmatterMatch[1]);
+                return { frontmatter: typeof frontmatter === 'object' && frontmatter !== null ? frontmatter : {}, body: frontmatterMatch[2] || '' };
+            } catch (error: any) {
+                new Notice(`Failed to parse YAML frontmatter: ${(error as Error).message}.`);
+                return { frontmatter: {}, body: content };
+            }
+        }
+        return { frontmatter: {}, body: content };
+    }
+
+    private buildFrontmatter(frontmatter: any, body: string): string {
+        const cleanFrontmatter: any = {};
+        for (const key in frontmatter) {
+            if (frontmatter[key] !== undefined) {
+                 cleanFrontmatter[key] = frontmatter[key];
+            }
+        }
+        if (Object.keys(cleanFrontmatter).length === 0) {
+            return body.trimStart(); 
+        }
+        let yamlString;
+        try {
+            // Ensure empty arrays are handled correctly by the stringifier
+            yamlString = stringifyYaml(cleanFrontmatter);
+        } catch (e: any) {
+            new Notice(`Error stringifying YAML: ${(e as Error).message}`);
+            console.error("Error stringifying YAML:", cleanFrontmatter, e);
+            return `---\n# YAML ERROR - CHECK CONSOLE\n---\n${body.trimStart()}`;
+        }
+        const trimmedYaml = yamlString.trim(); 
+        return `---\n${trimmedYaml}\n---\n${body.trimStart()}`;
     }
 
     private processIssueData(issue: ComicVineIssue, volume: ComicVineVolume): ComicIssueData {
@@ -732,7 +856,6 @@ export default class ComicSearchPlugin extends Plugin {
                 const roles = credit.role.split(',').map(r => r.trim());
                 roles.forEach(singleRole => {
                     if (!singleRole) return;
-
                     const role = singleRole.toLowerCase().split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
                     if (!creators[role]) creators[role] = [];
                     if (!creators[role].includes(credit.name)) creators[role].push(credit.name);
@@ -756,17 +879,15 @@ export default class ComicSearchPlugin extends Plugin {
         };
     }
 
-    private async ensureComicsFolder(): Promise<void> {
-        const folderPath = this.settings.comicsFolder;
+    private async ensureFolderExists(folderPath: string): Promise<void> {
         if (!this.app.vault.getAbstractFileByPath(folderPath)) {
             await this.app.vault.createFolder(folderPath);
-            new Notice(`Created comics folder: ${folderPath}`);
         }
     }
 }
 
 // ========================
-// SETTINGS TAB
+// SETTINGS TAB (SUGGESTED CHANGES)
 // ========================
 class ComicSearchSettingTab extends PluginSettingTab {
     plugin: ComicSearchPlugin;
@@ -794,15 +915,24 @@ class ComicSearchSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Comics Folder')
-            .setDesc('Folder where comic notes will be created')
+            .setDesc('Folder where comic issue notes will be created.')
             .addText(text => text.setPlaceholder('Comics').setValue(this.plugin.settings.comicsFolder).onChange(async (value) => {
                 this.plugin.settings.comicsFolder = value || 'Comics';
                 await this.plugin.saveSettings();
             }));
         
+        // NEW/SUGGESTED Setting
         new Setting(containerEl)
-            .setName('Create Creator Notes')
-            .setDesc('Automatically create notes for comic creators (writers, artists, etc.) if they do not exist in the "Creators" subfolder.')
+            .setName('People Folder')
+            .setDesc('Shared folder for all person notes (comic creators, musicians, etc.). Both plugins should point to the same folder.')
+            .addText(text => text.setPlaceholder('Entities/People').setValue(this.plugin.settings.peopleFolder).onChange(async (value) => {
+                this.plugin.settings.peopleFolder = value || 'Entities/People';
+                await this.plugin.saveSettings();
+            }));
+
+        new Setting(containerEl)
+            .setName('Create/Update Creator Notes')
+            .setDesc('Automatically create or update notes for comic creators in your People Folder.')
             .addToggle(toggle => toggle.setValue(this.plugin.settings.createCreatorNotes).onChange(async (value) => {
                 this.plugin.settings.createCreatorNotes = value;
                 await this.plugin.saveSettings();
@@ -810,7 +940,7 @@ class ComicSearchSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Default Page Count')
-            .setDesc('Default number of pages for comic issues (for reading tracker)')
+            .setDesc('Default number of pages for comic issues (for reading tracker).')
             .addText(text => text.setPlaceholder('22').setValue(String(this.plugin.settings.defaultPageCount)).onChange(async (value) => {
                 const num = parseInt(value);
                 if (!isNaN(num) && num > 0) this.plugin.settings.defaultPageCount = num;
@@ -819,7 +949,7 @@ class ComicSearchSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Reading Tracker Integration')
-            .setDesc('Include reading tracker compatible YAML frontmatter')
+            .setDesc('Include reading tracker compatible YAML frontmatter.')
             .addToggle(toggle => toggle.setValue(this.plugin.settings.enableReadingTracker).onChange(async (value) => {
                 this.plugin.settings.enableReadingTracker = value;
                 await this.plugin.saveSettings();
@@ -827,22 +957,11 @@ class ComicSearchSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Rate Limit Delay (ms)')
-            .setDesc('Delay between API requests to respect ComicVine rate limits (min 500)')
+            .setDesc('Delay between API requests to respect ComicVine rate limits (min 500).')
             .addText(text => text.setPlaceholder('1000').setValue(String(this.plugin.settings.rateLimitDelay)).onChange(async (value) => {
                 const num = parseInt(value);
                 if (!isNaN(num) && num >= 500) this.plugin.settings.rateLimitDelay = num;
                 await this.plugin.saveSettings();
             }));
-
-        containerEl.createEl('h3', { text: 'How to Use' });
-        containerEl.createEl('div').innerHTML = `
-            <ol>
-                <li>Get a free ComicVine API key and enter it above.</li>
-                <li>Use the ribbon icon or command palette to search for comics.</li>
-                <li>Select an issue to create a note for it.</li>
-                <li>If 'Create Creator Notes' is enabled, notes for the writers and artists will be created automatically in a subfolder.</li>
-            </ol>
-            <p><strong>Note:</strong> This plugin respects ComicVine's rate limits. Search results and creator downloads may take a moment.</p>
-        `;
     }
 }
