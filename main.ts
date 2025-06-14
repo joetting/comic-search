@@ -1,5 +1,5 @@
 // main.ts - ENHANCED COMIC SEARCH PLUGIN (REVISED)
-import { App, Plugin, PluginSettingTab, Setting, Modal, FuzzySuggestModal, Notice, TFile, FuzzyMatch, requestUrl, stringifyYaml, parseYaml, TFolder } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Modal, Notice, TFile, requestUrl, stringifyYaml, parseYaml, TFolder, ButtonComponent } from 'obsidian';
 
 // ========================
 // INTERFACES & TYPES
@@ -41,7 +41,18 @@ const DEFAULT_SETTINGS: ComicSearchSettings = {
     creatorImagesFolder: 'Assets/Creators',
 };
 
+type SearchEntityType = 'simple' | 'issue' | 'volume' | 'creator';
 type SearchResultItem = (ComicVineIssue & { resourceType: 'issue' }) | (ComicVineVolume & { resourceType: 'volume' });
+
+interface SearchCriteria {
+    query?: string;
+    volumeName?: string;
+    issueNumber?: string;
+    startYear?: string;
+    creatorName?: string;
+    creatorRole?: string;
+    endYear?: string;
+}
 
 interface ComicVineResponse<T> {
     error: string;
@@ -131,7 +142,7 @@ class ComicVineClient {
         return response.json;
     }
 
-    async search(query: string, abortSignal?: AbortSignal): Promise<SearchResultItem[]> {
+    async simpleSearch(query: string, abortSignal?: AbortSignal): Promise<SearchResultItem[]> {
         if (!this.apiKey) throw new Error('ComicVine API key not configured');
         const encodedQuery = encodeURIComponent(query);
         const url = `${this.baseUrl}/search/?api_key=${this.apiKey}&format=json&resources=issue,volume&query=${encodedQuery}&field_list=id,name,deck,image,resource_type,issue_number,cover_date,volume,start_year,publisher,count_of_issues&limit=20`;
@@ -139,6 +150,97 @@ class ComicVineClient {
         const response: ComicVineResponse<any[]> = await this.rateLimitedFetch(url, abortSignal);
         if (response.error !== 'OK') throw new Error(`ComicVine API error: ${response.error}`);
         return (response.results || []).map(r => ({ ...r, resourceType: r.resource_type }));
+    }
+
+    async structuredSearch(
+        resourceType: SearchEntityType,
+        criteria: SearchCriteria,
+        abortSignal?: AbortSignal
+    ): Promise<SearchResultItem[]> {
+        if (!this.apiKey) throw new Error('ComicVine API key not configured.');
+    
+        if (resourceType === 'volume') {
+            const filters: string[] = [];
+            if (criteria.volumeName) filters.push(`name:${encodeURIComponent(criteria.volumeName)}`);
+            if (criteria.startYear) filters.push(`start_year:${encodeURIComponent(criteria.startYear)}`);
+    
+            if (filters.length === 0) {
+                new Notice("Please provide a volume name or year.");
+                return [];
+            }
+            const volumeSearchUrl = `${this.baseUrl}/volumes/?api_key=${this.apiKey}&format=json&filter=${filters.join(',')}&field_list=id,name,start_year,publisher,count_of_issues,description,image,site_detail_url`;
+            const response: ComicVineResponse<ComicVineVolume[]> = await this.rateLimitedFetch(volumeSearchUrl, abortSignal);
+    
+            if (response.error !== 'OK') throw new Error(`ComicVine API error: ${response.error}`);
+            return (response.results || []).map(r => ({ ...r, resourceType: 'volume' }));
+        }
+    
+        if (resourceType === 'issue') {
+            if (!criteria.volumeName || !criteria.issueNumber) {
+                new Notice("For issue search, please provide both Volume Name and Issue Number.");
+                return [];
+            }
+            new Notice(`Finding volume "${criteria.volumeName}"...`, 2000);
+            const volumeSearchUrl = `${this.baseUrl}/search/?api_key=${this.apiKey}&format=json&resources=volume&query=${encodeURIComponent(criteria.volumeName)}&limit=1`;
+            const volResponse: ComicVineResponse<any[]> = await this.rateLimitedFetch(volumeSearchUrl, abortSignal);
+    
+            if (volResponse.error !== 'OK' || !volResponse.results || volResponse.results.length === 0) {
+                new Notice(`Volume "${criteria.volumeName}" not found.`);
+                return [];
+            }
+            const volumeId = volResponse.results[0].id;
+            new Notice(`Found volume. Searching for issue #${criteria.issueNumber}...`, 2000);
+    
+            const issueFilter = `volume:${volumeId},issue_number:${encodeURIComponent(criteria.issueNumber)}`;
+            const issueSearchUrl = `${this.baseUrl}/issues/?api_key=${this.apiKey}&format=json&filter=${issueFilter}&field_list=id,name,deck,image,issue_number,cover_date,volume,site_detail_url`;
+            const issueResponse: ComicVineResponse<ComicVineIssue[]> = await this.rateLimitedFetch(issueSearchUrl, abortSignal);
+    
+            if (issueResponse.error !== 'OK') throw new Error(`ComicVine API error: ${issueResponse.error}`);
+            return (issueResponse.results || []).map(r => ({ ...r, resourceType: 'issue' }));
+        }
+    
+        if (resourceType === 'creator') {
+            if (!criteria.creatorName) {
+                new Notice("Please provide a creator name.");
+                return [];
+            }
+    
+            new Notice(`Finding creator "${criteria.creatorName}"...`, 2000);
+            const personSearchUrl = `${this.baseUrl}/search/?api_key=${this.apiKey}&format=json&resources=person&query=${encodeURIComponent(criteria.creatorName)}&limit=1`;
+            const personResponse: ComicVineResponse<any[]> = await this.rateLimitedFetch(personSearchUrl, abortSignal);
+    
+            if (personResponse.error !== 'OK' || !personResponse.results || personResponse.results.length === 0) {
+                new Notice(`Creator "${criteria.creatorName}" not found.`);
+                return [];
+            }
+            const personId = personResponse.results[0].id;
+            new Notice(`Found creator. Searching for issues...`, 3000);
+    
+            const filters: string[] = [`person_credits:${personId}`];
+            if (criteria.startYear && criteria.endYear) {
+                filters.push(`cover_date:${criteria.startYear}-01-01|${criteria.endYear}-12-31`);
+            } else if (criteria.startYear) {
+                filters.push(`cover_date:${criteria.startYear}-01-01|${criteria.startYear}-12-31`);
+            }
+            
+            const issueSearchUrl = `${this.baseUrl}/issues/?api_key=${this.apiKey}&format=json&filter=${filters.join(',')}&sort=cover_date:asc&field_list=id,name,deck,image,issue_number,cover_date,volume,site_detail_url,person_credits&limit=100`;
+            const issueResponse: ComicVineResponse<ComicVineIssue[]> = await this.rateLimitedFetch(issueSearchUrl, abortSignal);
+    
+            if (issueResponse.error !== 'OK') throw new Error(`ComicVine API error: ${issueResponse.error}`);
+            
+            let issues = (issueResponse.results || []).map(r => ({ ...r, resourceType: 'issue' as 'issue' }));
+
+            if (criteria.creatorRole) {
+                const roleLower = criteria.creatorRole.toLowerCase();
+                issues = issues.filter(issue => 
+                    issue.person_credits.some(p => p.id === personId && p.role.toLowerCase().includes(roleLower))
+                );
+            }
+
+            return issues;
+        }
+    
+        return [];
     }
 
     async getVolumeDetails(volumeId: number, includeIssues: boolean = false): Promise<ComicVineVolume> {
@@ -168,69 +270,184 @@ class ComicVineClient {
 // ========================
 // SEARCH MODAL
 // ========================
-class ComicSearchModal extends FuzzySuggestModal<SearchResultItem> {
+class ComicSearchModal extends Modal {
     private plugin: ComicSearchPlugin;
     private client: ComicVineClient;
-    private searchResults: SearchResultItem[] = [];
-    private searchTimeout: NodeJS.Timeout | null = null;
+    private searchType: SearchEntityType = 'simple';
+    private searchCriteria: SearchCriteria = {};
+    private resultsContainer!: HTMLElement;
+    private searchFieldsContainer!: HTMLElement;
     private abortController: AbortController | null = null;
 
     constructor(app: App, plugin: ComicSearchPlugin) {
         super(app);
         this.plugin = plugin;
         this.client = new ComicVineClient(plugin.settings.comicVineApiKey, plugin.settings.rateLimitDelay);
-        this.setPlaceholder("Search for comics (issues or volumes)...");
-        this.setInstructions([
-            { command: "↑↓", purpose: "navigate" },
-            { command: "↵", purpose: "select" },
-            { command: "esc", purpose: "dismiss" }
-        ]);
     }
 
-    getItems(): SearchResultItem[] { 
-        return this.searchResults; 
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.addClass('comic-search-modal');
+        contentEl.createEl('h2', { text: 'Search ComicVine Database' });
+
+        new Setting(contentEl)
+            .setName('Search for:')
+            .addDropdown(dropdown => dropdown
+                .addOption('simple', 'Simple Fuzzy Search')
+                .addOption('issue', 'Specific Issue')
+                .addOption('volume', 'Specific Volume')
+                .addOption('creator', 'Creator\'s Work')
+                .setValue(this.searchType)
+                .onChange(value => {
+                    this.searchType = value as SearchEntityType;
+                    this.renderSearchFields();
+                }));
+
+        this.searchFieldsContainer = contentEl.createDiv({ cls: 'comic-search-fields-container' });
+        this.renderSearchFields();
+
+        new Setting(contentEl)
+            .addButton(button => button
+                .setButtonText('Search')
+                .setCta()
+                .onClick(() => this.performSearch()));
+
+        this.resultsContainer = contentEl.createEl('div', { cls: 'comic-search-results-container' });
+        this.addStyles();
     }
 
-    getSuggestions(query: string): FuzzyMatch<SearchResultItem>[] {
-        return this.searchResults.map(item => ({
-            item: item,
-            match: { score: 0, matches: [] } // We are not using fuzzy search score here, just displaying API results
-        }));
-    }
+    private renderSearchFields() {
+        this.searchFieldsContainer.empty();
+        this.searchCriteria = {};
 
-    getItemText(item: SearchResultItem): string {
-        if (item.resourceType === 'issue') {
-            return `${item.volume.name} #${item.issue_number}${item.name ? ` - ${item.name}` : ''}`;
-        } else {
-            return `${item.name} (${item.start_year}) [Volume]`;
+        const createTextField = (name: string, placeholder: string, criteriaKey: keyof SearchCriteria) => {
+            new Setting(this.searchFieldsContainer)
+                .setName(name)
+                .addText(text => {
+                    text.setPlaceholder(placeholder)
+                        .onChange(value => {
+                            (this.searchCriteria[criteriaKey] as any) = value.trim();
+                        });
+                    text.inputEl.addEventListener('keypress', (event) => {
+                        if (event.key === 'Enter') {
+                            this.performSearch();
+                        }
+                    });
+                });
+        };
+        
+        const createDropdownField = (name: string, options: Record<string, string>, criteriaKey: keyof SearchCriteria) => {
+            new Setting(this.searchFieldsContainer)
+                .setName(name)
+                .addDropdown(dropdown => {
+                    dropdown.addOptions(options)
+                    .onChange(value => {
+                        (this.searchCriteria[criteriaKey] as any) = value;
+                    })
+                })
+        }
+
+        switch(this.searchType) {
+            case 'simple':
+                createTextField('Search Term:', 'e.g., Batman #497 or Green Lantern', 'query');
+                break;
+            case 'issue':
+                createTextField('Volume Name:', 'e.g., The Amazing Spider-Man', 'volumeName');
+                createTextField('Issue Number:', 'e.g., 300', 'issueNumber');
+                break;
+            case 'volume':
+                createTextField('Volume Name:', 'e.g., Watchmen', 'volumeName');
+                createTextField('Start Year (optional):', 'e.g., 1986', 'startYear');
+                break;
+            case 'creator':
+                createTextField('Creator Name:', 'e.g., Jack Kirby', 'creatorName');
+                const roles = {'': 'Any Role', 'writer': 'Writer', 'penciler': 'Penciler', 'inker': 'Inker', 'colorist': 'Colorist', 'editor': 'Editor', 'cover': 'Cover Artist'};
+                createDropdownField('Role (optional):', roles, 'creatorRole');
+                createTextField('Start Year (optional):', 'e.g., 1961', 'startYear');
+                createTextField('End Year (optional):', 'e.g., 1963', 'endYear');
+                break;
+        }
+
+        const firstInput = this.searchFieldsContainer.querySelector('input[type="text"]') as HTMLInputElement | null;
+        if (firstInput) {
+            setTimeout(() => firstInput.focus(), 50);
         }
     }
 
-    renderSuggestion(match: FuzzyMatch<SearchResultItem>, el: HTMLElement) {
-        const item = match.item;
-        const container = el.createDiv({ cls: 'comic-search-suggestion' });
-        const imageUrl = item.image?.small_url;
-        if (imageUrl) {
-            const imageContainer = container.createDiv({ cls: 'comic-search-image' });
-            imageContainer.createEl('img', { cls: 'comic-cover-thumb', attr: { src: imageUrl } });
+    async performSearch() {
+        this.resultsContainer.empty();
+        if (this.abortController) {
+            this.abortController.abort();
         }
-        const textContainer = container.createDiv({ cls: 'comic-search-text' });
-        if (item.resourceType === 'issue') {
-            textContainer.createDiv({ cls: 'comic-search-title' }).setText(`${item.volume.name} #${item.issue_number}`);
-            if (item.name && item.name !== item.volume.name) textContainer.createDiv({ cls: 'comic-search-subtitle', text: item.name });
-            textContainer.createDiv({ cls: 'comic-search-meta', text: `${item.cover_date || 'Unknown date'}` });
-            if (item.deck) textContainer.createDiv({ cls: 'comic-search-desc', text: item.deck.substring(0, 120) + '...' });
-        } else {
-            textContainer.createDiv({ cls: 'comic-search-title' }).setText(`${item.name}`);
-            const pubName = item.publisher?.name || 'Unknown';
-            textContainer.createDiv({ cls: 'comic-search-meta', text: `Volume • ${item.start_year} • ${pubName} • ${item.count_of_issues} issues` });
-            if (item.description) textContainer.createDiv({ cls: 'comic-search-desc', text: this.plugin.cleanDescription(item.description).substring(0, 120) + '...' });
+        this.abortController = new AbortController();
+
+        this.resultsContainer.createEl('p', { text: `Searching...` });
+
+        try {
+            let results: SearchResultItem[];
+            if (this.searchType === 'simple') {
+                if (!this.searchCriteria.query) {
+                    new Notice("Please enter a search term.");
+                    this.resultsContainer.empty();
+                    return;
+                }
+                results = await this.client.simpleSearch(this.searchCriteria.query, this.abortController.signal);
+            } else {
+                results = await this.client.structuredSearch(this.searchType, this.searchCriteria, this.abortController.signal);
+            }
+            this.displayResults(results);
+        } catch (error: any) {
+            if (error.name !== 'AbortError') {
+                this.resultsContainer.empty();
+                new Notice(`Search failed: ${error.message}.`);
+                console.error("ComicVine search error:", error);
+            }
         }
     }
 
-    async onChooseItem(item: SearchResultItem, evt: MouseEvent | KeyboardEvent) {
-        this.cancelPendingSearch();
-        this.close();
+    private displayResults(results: SearchResultItem[]) {
+        this.resultsContainer.empty();
+        if (results.length === 0) {
+            this.resultsContainer.createEl('p', { text: 'No results found.' });
+            return;
+        }
+
+        results.forEach(item => {
+            const itemEl = this.resultsContainer.createDiv({ cls: 'comic-search-result-item' });
+            const imageContainer = itemEl.createDiv({ cls: 'comic-search-image' });
+            if (item.image?.small_url) {
+                 imageContainer.createEl('img', { cls: 'comic-cover-thumb', attr: { src: item.image.small_url } });
+            }
+
+            const infoEl = itemEl.createDiv({ cls: 'comic-search-info' });
+            if (item.resourceType === 'issue') {
+                infoEl.createEl('strong', { text: `${item.volume.name} #${item.issue_number}` });
+                if (item.name && item.name !== item.volume.name) {
+                    infoEl.createDiv({ text: item.name, cls: 'comic-search-detail comic-search-subtitle' });
+                }
+                if (item.cover_date) {
+                    infoEl.createDiv({ text: `Cover Date: ${item.cover_date}`, cls: 'comic-search-detail' });
+                }
+            } else { // Volume
+                infoEl.createEl('strong', { text: `${item.name} (${item.start_year})` });
+                if (item.publisher?.name) {
+                    infoEl.createDiv({ text: `Publisher: ${item.publisher.name}`, cls: 'comic-search-detail' });
+                }
+                infoEl.createDiv({ text: `${item.count_of_issues} issues`, cls: 'comic-search-detail' });
+            }
+
+            const actionsEl = itemEl.createDiv({ cls: 'comic-search-actions' });
+            new ButtonComponent(actionsEl)
+                .setButtonText('Import')
+                .onClick(() => this.onChooseItem(item));
+        });
+    }
+
+    async onChooseItem(item: SearchResultItem) {
+        if (this.searchType !== 'creator') {
+            this.close();
+        }
         try {
             if (item.resourceType === 'issue') {
                 await this.plugin.createIssueNote(item as ComicVineIssue);
@@ -242,84 +459,47 @@ class ComicSearchModal extends FuzzySuggestModal<SearchResultItem> {
             console.error('Failed to create note:', error);
         }
     }
+    
+    private addStyles(): void {
+        const styleId = 'comic-search-modal-styles';
+        if (document.getElementById(styleId)) return;
 
-    private cancelPendingSearch() {
-        if (this.searchTimeout) { 
-            clearTimeout(this.searchTimeout); 
-            this.searchTimeout = null; 
-        }
-        if (this.abortController) { 
-            this.abortController.abort(); 
-            this.abortController = null;
-        }
-    }
-
-    private async performSearch(query: string) {
-        this.cancelPendingSearch();
-        if (query.length < 3) {
-            this.searchResults = [];
-            (this as any).updateSuggestions();
-            return;
-        }
-
-        this.abortController = new AbortController();
-        try {
-            const results = await this.client.search(query, this.abortController.signal);
-            
-            if (!this.abortController.signal.aborted) {
-                this.searchResults = results;
-                (this as any).updateSuggestions();
+        const style = document.createElement('style');
+        style.id = styleId;
+        style.textContent = `
+            .comic-search-results-container {
+                margin-top: 15px;
+                max-height: 400px;
+                overflow-y: auto;
+                border: 1px solid var(--background-modifier-border);
+                padding: 5px;
             }
-        } catch (error) {
-            if ((error as any).name !== 'AbortError') {
-                console.error('Search failed:', error);
-                new Notice(`Search failed: ${(error as Error).message}`);
+            .comic-search-result-item {
+                display: flex;
+                align-items: flex-start;
+                gap: 12px;
+                padding: 8px 10px;
+                border-bottom: 1px solid var(--background-modifier-border);
             }
-            this.searchResults = [];
-            (this as any).updateSuggestions();
-        }
-    }
-
-    onInput() {
-        const query = this.inputEl.value.trim();
-        this.cancelPendingSearch();
-        
-        if (query.length < 3) {
-            this.searchResults = [];
-            (this as any).updateSuggestions();
-            return;
-        }
-
-        this.searchTimeout = setTimeout(() => {
-            this.performSearch(query);
-        }, 500); // Debounce search requests
-    }
-
-    onOpen() {
-        super.onOpen();
-        const styleId = 'comic-search-styles';
-        if (!document.getElementById(styleId)) {
-            const style = document.createElement('style');
-            style.id = styleId;
-            style.textContent = `
-                .comic-search-suggestion { display: flex; padding: 8px 0; align-items: flex-start; gap: 12px; }
-                .comic-search-image { flex-shrink: 0; width: 45px; }
-                .comic-cover-thumb { width: 45px; height: auto; border-radius: 3px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
-                .comic-search-text { flex: 1; min-width: 0; }
-                .comic-search-title { font-weight: bold; }
-                .comic-search-subtitle { font-style: italic; color: var(--text-muted); }
-                .comic-search-meta { font-size: 0.85em; color: var(--text-muted); }
-                .comic-search-desc { font-size: 0.8em; color: var(--text-faint); margin-top: 4px; }
-            `;
-            document.head.appendChild(style);
-        }
+            .comic-search-result-item:last-child { border-bottom: none; }
+            .comic-search-image { flex-shrink: 0; width: 60px; }
+            .comic-cover-thumb { width: 100%; height: auto; border-radius: 3px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+            .comic-search-info { flex-grow: 1; display: flex; flex-direction: column; min-width: 0; }
+            .comic-search-info strong { font-size: var(--font-ui-normal); }
+            .comic-search-detail { font-size: var(--font-ui-small); color: var(--text-muted); }
+            .comic-search-subtitle { font-style: italic; }
+            .comic-search-actions { margin-left: auto; flex-shrink: 0; }
+            .comic-search-actions button { font-size: var(--font-ui-small); }
+        `;
+        document.head.appendChild(style);
     }
 
     onClose() {
-        super.onClose();
-        this.cancelPendingSearch();
-        const style = document.getElementById('comic-search-styles');
-        if (style) style.remove();
+        if (this.abortController) {
+            this.abortController.abort();
+        }
+        const { contentEl } = this;
+        contentEl.empty();
     }
 }
 
@@ -334,7 +514,7 @@ export default class ComicSearchPlugin extends Plugin {
         this.addRibbonIcon('book-heart', 'Search Comics', () => new ComicSearchModal(this.app, this).open());
         this.addCommand({
             id: 'search-comics',
-            name: 'Search for comics (issues & volumes)',
+            name: 'Search for comics',
             callback: () => new ComicSearchModal(this.app, this).open(),
         });
         this.addSettingTab(new ComicSearchSettingTab(this.app, this));
@@ -440,6 +620,8 @@ export default class ComicSearchPlugin extends Plugin {
                 const leaf = this.app.workspace.getMostRecentLeaf();
                 if (leaf) await leaf.openFile(file);
                 new Notice(`Created note: ${fileName}`);
+            } else {
+                 new Notice(`Created: ${fileName}`);
             }
         } catch (error) {
             console.error(`Error creating note for issue #${issue.issue_number}: `, error);
