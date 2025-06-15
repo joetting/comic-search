@@ -17,6 +17,7 @@ interface ComicSearchSettings {
     comicVineApiKey: string;
     comicsFolder: string;
     peopleFolder: string;
+    conceptsFolder: string; // Folder for roles and other concepts
     defaultPageCount: number;
     enableReadingTracker: boolean;
     rateLimitDelay: number;
@@ -31,6 +32,7 @@ const DEFAULT_SETTINGS: ComicSearchSettings = {
     comicVineApiKey: '',
     comicsFolder: 'Comics',
     peopleFolder: 'Entities/People',
+    conceptsFolder: 'Concepts',
     defaultPageCount: 22,
     enableReadingTracker: true,
     rateLimitDelay: 1000,
@@ -549,44 +551,58 @@ export default class ComicSearchPlugin extends Plugin {
         const sanitizedVolumeName = this.sanitizeForFileName(volumeData.name);
         const volumeFolderPath = `${this.settings.comicsFolder}/${sanitizedVolumeName}`;
         await this.ensureFolderExists(volumeFolderPath);
-
+    
         new Notice(`Fetching details for volume: ${volumeData.name}`);
         const volume = await client.getVolumeDetails(volumeData.id, true);
-
+    
         let localCoverPath: string | null = null;
         if (this.settings.downloadComicImages && volume.image?.super_url) {
             const fileName = `volume-${volume.id}-cover.jpg`;
             localCoverPath = await this.downloadImage(volume.image.super_url, this.settings.comicImagesFolder, fileName);
         }
-
-        const volumeNoteContent = this.generateVolumeNoteContent(volume, localCoverPath);
-        const volumeFilePath = `${volumeFolderPath}/${sanitizedVolumeName} (Compilation).md`;
+    
+        const volumeFileName = `${sanitizedVolumeName} (Compilation).md`;
+        const volumeFilePath = `${volumeFolderPath}/${volumeFileName}`;
         
-        if (!this.app.vault.getAbstractFileByPath(volumeFilePath)) {
-            await this.app.vault.create(volumeFilePath, volumeNoteContent);
+        let volumeFile = this.app.vault.getAbstractFileByPath(volumeFilePath) as TFile;
+        if (!volumeFile) {
+            const volumeNoteContent = this.generateVolumeNoteContent(volume, localCoverPath);
+            volumeFile = await this.app.vault.create(volumeFilePath, volumeNoteContent);
             new Notice(`Created compilation note for ${volume.name}`);
         }
-
+    
         if (!volume.issues || volume.issues.length === 0) {
             new Notice(`No individual issues found for ${volume.name}.`);
             return;
         }
-
+    
         new Notice(`Found ${volume.issues.length} issues. Creating notes...`);
         let count = 0;
+        let volumeContent = await this.app.vault.read(volumeFile);
+    
         for (const issueSummary of volume.issues.sort((a,b) => parseFloat(a.issue_number) - parseFloat(b.issue_number))) {
             const issueWithVolume: ComicVineIssue = {
                 ...issueSummary,
                 volume: { id: volume.id, name: volume.name, api_detail_url: volume.api_detail_url }
             };
-            await this.createIssueNote(issueWithVolume, volumeFolderPath);
+            const issueFile = await this.createIssueNote(issueWithVolume, volumeFolderPath);
+            
+            if (issueFile) {
+                const issueLink = `- [[${issueFile.basename}]]`;
+                if (!volumeContent.includes(issueLink)) {
+                    volumeContent += `\n${issueLink}`;
+                }
+            }
+            
             count++;
             new Notice(`Processed issue #${issueSummary.issue_number} (${count}/${volume.issues.length})`, 1500);
         }
+    
+        await this.app.vault.modify(volumeFile, volumeContent);
         new Notice(`Finished processing all issues for ${volume.name}.`);
     }
 
-    async createIssueNote(issue: ComicVineIssue, targetFolder?: string): Promise<void> {
+    async createIssueNote(issue: ComicVineIssue, targetFolder?: string): Promise<TFile | null> {
         try {
             const client = new ComicVineClient(this.settings.comicVineApiKey, this.settings.rateLimitDelay);
             const detailedIssue = await client.getIssueDetails(issue.id);
@@ -605,9 +621,10 @@ export default class ComicSearchPlugin extends Plugin {
             await this.ensureFolderExists(folderPath);
             
             const filePath = `${folderPath}/${fileName}`;
-            if (this.app.vault.getAbstractFileByPath(filePath)) {
+            const existingFile = this.app.vault.getAbstractFileByPath(filePath) as TFile;
+            if (existingFile) {
                 if (!targetFolder) new Notice(`Note for ${data.volume.name} #${data.issue.issue_number} already exists.`);
-                return;
+                return existingFile;
             }
             
             const file = await this.app.vault.create(filePath, noteContent);
@@ -623,9 +640,11 @@ export default class ComicSearchPlugin extends Plugin {
             } else {
                  new Notice(`Created: ${fileName}`);
             }
+            return file;
         } catch (error) {
             console.error(`Error creating note for issue #${issue.issue_number}: `, error);
             new Notice(`Failed to create note for issue #${issue.issue_number}`);
+            return null;
         }
     }
 
@@ -654,7 +673,7 @@ export default class ComicSearchPlugin extends Plugin {
         const yaml = stringifyYaml(frontmatter);
         const coverEmbed = localCoverPath ? `![[${this.app.vault.getAbstractFileByPath(localCoverPath)?.name}|150]]` : (volume.image?.super_url ? `![cover|150](${volume.image.super_url})` : '');
         const description = volume.description ? `\n\n### Description\n${this.cleanDescription(volume.description)}` : '';
-        return `---\n${yaml}---\n\n${coverEmbed}${description}\n\n### Contained Issues\n`;
+        return `---\n${yaml}---\n\n${coverEmbed}${description}\n\n### Contained Issues`;
     }
 
     private generateIssueNoteContent(data: ComicIssueData): string {
@@ -681,7 +700,7 @@ export default class ComicSearchPlugin extends Plugin {
             tags: ['comic-issue', this.sanitizeForTag(publisher), this.sanitizeForTag(volume.name)],
             'creation date': now.toISOString(),
             'modification date': now.toISOString(),
-            volume: `[[${this.cleanForWikilink(volume.name)} (Compilation).md|${this.cleanForWikilink(volume.name)}]]`,
+            volume: `[[${this.cleanForWikilink(volume.name)} (Compilation)]]`,
             issueNumber: this.quoteYamlString(issue.issue_number),
             publisher: `[[${this.cleanForWikilink(publisher)}]]`,
             coverDate: this.parseComicDate(issue.cover_date),
@@ -875,7 +894,6 @@ export default class ComicSearchPlugin extends Plugin {
                 const personDetails = await client.getPersonDetails(creator.api_detail_url);
     
                 const now = new Date();
-                // REVISED LOGIC: Set entityType to "Person"
                 if (!frontmatter.entityType || frontmatter.entityType === "ComicCreator") { frontmatter.entityType = "Person"; changed = true; }
                 if (!frontmatter.name) { frontmatter.name = personDetails.name; changed = true; }
                 if (!frontmatter.comicVineId) { frontmatter.comicVineId = personDetails.id; changed = true; }
@@ -883,7 +901,6 @@ export default class ComicSearchPlugin extends Plugin {
                 
                 if (!personFile) {
                     frontmatter.aliases = [];
-                    // REVISED LOGIC: Add both tags for context
                     frontmatter.tags = ['person', 'comic-creator'];
                     frontmatter['creation date'] = now.toISOString();
                     changed = true;
@@ -964,7 +981,7 @@ export default class ComicSearchPlugin extends Plugin {
     private async getOrCreateRoleNote(roleName: string): Promise<TFile> {
         const capitalizedRole = roleName.charAt(0).toUpperCase() + roleName.slice(1).trim();
         const filename = this.sanitizeForFileName(capitalizedRole) + ' (Role).md';
-        const conceptsFolder = `${this.settings.comicsFolder}/Concepts`;
+        const conceptsFolder = this.settings.conceptsFolder;
         await this.ensureFolderExists(conceptsFolder);
 
         const filepath = `${conceptsFolder}/${filename}`;
@@ -1089,6 +1106,7 @@ class ComicSearchSettingTab extends PluginSettingTab {
         containerEl.createEl('h3', { text: 'File & Note Configuration' });
         new Setting(containerEl).setName('Comics Folder').addText(text => text.setPlaceholder('Comics').setValue(this.plugin.settings.comicsFolder).onChange(async (value) => { this.plugin.settings.comicsFolder = value || 'Comics'; await this.plugin.saveSettings(); }));
         new Setting(containerEl).setName('People Folder').setDesc('Shared folder for all person notes (comic creators, musicians, etc.).').addText(text => text.setPlaceholder('Entities/People').setValue(this.plugin.settings.peopleFolder).onChange(async (value) => { this.plugin.settings.peopleFolder = value || 'Entities/People'; await this.plugin.saveSettings(); }));
+        new Setting(containerEl).setName('Concepts Folder').setDesc('Folder for conceptual notes like roles (e.g., Writer, Penciler).').addText(text => text.setPlaceholder('Concepts').setValue(this.plugin.settings.conceptsFolder).onChange(async (value) => { this.plugin.settings.conceptsFolder = value || 'Concepts'; await this.plugin.saveSettings(); }));
         new Setting(containerEl).setName('Create/Update Creator Notes').setDesc('Automatically create or update notes for comic creators in your People Folder.').addToggle(toggle => toggle.setValue(this.plugin.settings.createCreatorNotes).onChange(async (value) => { this.plugin.settings.createCreatorNotes = value; await this.plugin.saveSettings(); }));
 
         containerEl.createEl('h3', { text: 'Image Downloading' });
